@@ -62,23 +62,24 @@ preferences {
     }
 
     section ("InfluxDB Database:") {
-        input "prefDatabaseHost", "text", title: "Host", defaultValue: "10.10.10.10", required: true
+        input "prefDatabaseHost", "text", title: "Host", defaultValue: "192.168.1.252", required: true
         input "prefDatabasePort", "text", title: "Port", defaultValue: "8086", required: true
-        input "prefDatabaseName", "text", title: "Database Name", defaultValue: "", required: true
+        input "prefDatabaseName", "text", title: "Database Name", defaultValue: "SmartThings", required: true
         input "prefDatabaseUser", "text", title: "Username", required: false
         input "prefDatabasePass", "text", title: "Password", required: false
+        input "prefDatabaseToken", "text", title: "Token", required: false
     }
-    
+
     section("Polling:") {
         input "prefSoftPollingInterval", "number", title:"Soft-Polling interval (minutes)", defaultValue: 10, required: true
     }
-    
+
     section("System Monitoring:") {
         input "prefLogModeEvents", "bool", title:"Log Mode Events?", defaultValue: true, required: true
         input "prefLogHubProperties", "bool", title:"Log Hub Properties?", defaultValue: true, required: true
         input "prefLogLocationProperties", "bool", title:"Log Location Properties?", defaultValue: true, required: true
     }
-    
+
     section("Devices To Monitor:") {
         input "accelerometers", "capability.accelerationSensor", title: "Accelerometers", multiple: true, required: false
         input "alarms", "capability.alarm", title: "Alarms", multiple: true, required: false
@@ -137,7 +138,7 @@ preferences {
 def installed() {
     state.installedAt = now()
     state.loggingLevelIDE = 5
-    log.debug "${app.label}: Installed with settings: ${settings}" 
+    log.debug "${app.label}: Installed with settings: ${settings}"
 }
 
 /**
@@ -146,42 +147,47 @@ def installed() {
  *  Runs when the app is uninstalled.
  **/
 def uninstalled() {
-    logger("uninstalled()","trace")
+    logger("uninstalled()","info")
 }
 
 /**
  *  updated()
- * 
+ *
  *  Runs when app settings are changed.
- * 
+ *
  *  Updates device.state with input values and other hard-coded values.
- *  Builds state.deviceAttributes which describes the attributes that will be monitored for each device collection 
+ *  Builds state.deviceAttributes which describes the attributes that will be monitored for each device collection
  *  (used by manageSubscriptions() and softPoll()).
  *  Refreshes scheduling and subscriptions.
  **/
 def updated() {
-    logger("updated()","trace")
+    logger("updated()","info")
 
     // Update internal state:
     state.loggingLevelIDE = (settings.configLoggingLevelIDE) ? settings.configLoggingLevelIDE.toInteger() : 3
-    
+
     // Database config:
     state.databaseHost = settings.prefDatabaseHost
     state.databasePort = settings.prefDatabasePort
     state.databaseName = settings.prefDatabaseName
     state.databaseUser = settings.prefDatabaseUser
-    state.databasePass = settings.prefDatabasePass 
-    
+    state.databasePass = settings.prefDatabasePass
+    state.databaseToken = settings.prefDatabaseToken
+
+    // https://docs.influxdata.com/influxdb/v2.0/reference/api/influxdb-1x/
     state.path = "/write?db=${state.databaseName}"
-    state.headers = [:] 
+    state.headers = [:]
     state.headers.put("HOST", "${state.databaseHost}:${state.databasePort}")
     state.headers.put("Content-Type", "application/x-www-form-urlencoded")
     if (state.databaseUser && state.databasePass) {
         state.headers.put("Authorization", encodeCredentialsBasic(state.databaseUser, state.databasePass))
     }
+    if (state.databaseToken) {
+        state.headers.put("Authorization", "Token " + state.databaseToken)
+    }
 
     // Build array of device collections and the attributes we want to report on for that collection:
-    //  Note, the collection names are stored as strings. Adding references to the actual collection 
+    //  Note, the collection names are stored as strings. Adding references to the actual collection
     //  objects causes major issues (possibly memory issues?).
     state.deviceAttributes = []
     state.deviceAttributes << [ devices: 'accelerometers', attributes: ['acceleration']]
@@ -228,7 +234,7 @@ def updated() {
     // Configure Scheduling:
     state.softPollingInterval = settings.prefSoftPollingInterval.toInteger()
     manageSchedules()
-    
+
     // Configure Subscriptions:
     manageSubscriptions()
 }
@@ -239,18 +245,18 @@ def updated() {
 
 /**
  *  handleAppTouch(evt)
- * 
+ *
  *  Used for testing.
  **/
 def handleAppTouch(evt) {
     logger("handleAppTouch()","trace")
-    
+
     softPoll()
 }
 
 /**
  *  handleModeEvent(evt)
- * 
+ *
  *  Log Mode changes.
  **/
 def handleModeEvent(evt) {
@@ -268,16 +274,19 @@ def handleModeEvent(evt) {
  *
  *  Builds data to send to InfluxDB.
  *   - Escapes and quotes string values.
- *   - Calculates logical binary values where string values can be 
+ *   - Calculates logical binary values where string values can be
  *     represented as binary values (e.g. contact: closed = 1, open = 0)
- * 
- *  Useful references: 
+ *
+ *  Useful references:
  *   - http://docs.smartthings.com/en/latest/capabilities-reference.html
  *   - https://docs.influxdata.com/influxdb/v0.10/guides/writing_data/
  **/
 def handleEvent(evt) {
-    logger("handleEvent(): $evt.displayName($evt.name:$evt.unit) $evt.value","info")
-    
+    logger("handleEvent(): $evt.displayName($evt.name:$evt.unit) $evt.value","debug")
+    state.intervalEventCount = state.intervalEventCount + 1
+    return handleEventHelper(evt)
+}
+def handleEventHelper(evt) {
     // Build data string to send to InfluxDB:
     //  Format: <measurement>[,<tag_name>=<tag_value>] field=<field_value>
     //    If value is an integer, it must have a trailing "i"
@@ -297,9 +306,9 @@ def handleEvent(evt) {
     def unit = escapeStringForInfluxDB(evt.unit)
     def value = escapeStringForInfluxDB(evt.value)
     def valueBinary = ''
-    
+
     def data = "${measurement},deviceId=${deviceId},deviceName=${deviceName},groupId=${groupId},groupName=${groupName},hubId=${hubId},hubName=${hubName},locationId=${locationId},locationName=${locationName}"
-    
+
     // Unit tag and fields depend on the event type:
     //  Most string-valued attributes can be translated to a binary value too.
     if ('acceleration' == evt.name) { // acceleration: Calculate a binary value (active = 1, inactive = 0)
@@ -430,7 +439,7 @@ def handleEvent(evt) {
     }
     else if ('threeAxis' == evt.name) { // threeAxis: Format to x,y,z values.
         unit = 'threeAxis'
-        def valueXYZ = evt.value.split(",")
+        def valueXYZ = evt.value.replaceAll("\\[|\\]", "").split(",")
         def valueX = valueXYZ[0]
         def valueY = valueXYZ[1]
         def valueZ = valueXYZ[2]
@@ -482,7 +491,7 @@ def handleEvent(evt) {
     else {
         data += ",unit=${unit} value=${value}"
     }
-    
+
     // Post data to InfluxDB:
     postToInfluxDB(data)
 
@@ -497,7 +506,7 @@ def handleEvent(evt) {
  *  softPoll()
  *
  *  Executed by schedule.
- * 
+ *
  *  Forces data to be posted to InfluxDB (even if an event has not been triggered).
  *  Doesn't poll devices, just builds a fake event to pass to handleEvent().
  *
@@ -505,9 +514,11 @@ def handleEvent(evt) {
  **/
 def softPoll() {
     logger("softPoll()","trace")
-    
+
     logSystemProperties()
-    
+
+    def count = 0
+
     // Iterate over each attribute for each device, in each device collection in deviceAttributes:
     def devs // temp variable to hold device collection.
     state.deviceAttributes.each { da ->
@@ -515,11 +526,13 @@ def softPoll() {
         if (devs && (da.attributes)) {
             devs.each { d ->
                 da.attributes.each { attr ->
+                    logger("softPoll() device:${d} attr: ${attr} value: ${d.latestState(attr)?.value}", "trace")
                     if (d.hasAttribute(attr) && d.latestState(attr)?.value != null) {
-                        logger("softPoll(): Softpolling device ${d} for attribute: ${attr}","info")
-                        // Send fake event to handleEvent():
-                        handleEvent([
-                            name: attr, 
+                        logger("softPoll(): Softpolling device ${d} for attribute: ${attr}","debug")
+                        // Send faked event to handleEventHelper():
+                        count += 1
+                        handleEventHelper([
+                            name: attr,
                             value: d.latestState(attr)?.value,
                             unit: d.latestState(attr)?.unit,
                             device: d,
@@ -531,7 +544,8 @@ def softPoll() {
             }
         }
     }
-
+    logger("softPoll(): Polled: ${count}. Subscribed: ${state.intervalEventCount}","info")
+    state.intervalEventCount = 0
 }
 
 /**
@@ -596,8 +610,8 @@ def logSystemProperties() {
  *  Uses hubAction instead of httpPost() in case InfluxDB server is on the same LAN as the Smartthings Hub.
  **/
 def postToInfluxDB(data) {
-    logger("postToInfluxDB(): Posting data to InfluxDB: Host: ${state.databaseHost}, Port: ${state.databasePort}, Database: ${state.databaseName}, Data: [${data}]","debug")
-    
+    logger("postToInfluxDB(): Posting data to InfluxDB: Host: ${state.databaseHost}, Port: ${state.databasePort}, Database: ${state.databaseName}, Data: [${data}]","trace")
+
     try {
         def hubAction = new physicalgraph.device.HubAction(
         	[
@@ -609,7 +623,12 @@ def postToInfluxDB(data) {
             null,
             [ callback: handleInfluxResponse ]
         )
-		
+
+// for influxdb 2.x -> create a bucket, associate bucketID with v1 database name via "dbrps" api
+// curl --request POST http://192.168.1.6:8086/api/v2/dbrps --header "Authorization: Token token" --header 'Content-type: application/json'  --data '{ "bucketID": "d2fe5057f5b0f271", "database": "SmartThings", "default": true, "orgID": "3e610d1f1d0bd627", "retention_policy": "year" }'
+
+		logger("postToInfluxDB(): request: ${hubAction}","trace")
+
         sendHubCommand(hubAction)
     }
     catch (Exception e) {
@@ -617,7 +636,7 @@ def postToInfluxDB(data) {
     }
 
     // For reference, code that could be used for WAN hosts:
-    // def url = "http://${state.databaseHost}:${state.databasePort}/write?db=${state.databaseName}" 
+    // def url = "http://${state.databaseHost}:${state.databasePort}/write?db=${state.databaseName}"
     //    try {
     //      httpPost(url, data) { response ->
     //          if (response.status != 999 ) {
@@ -626,7 +645,7 @@ def postToInfluxDB(data) {
     //              log.debug "Response contentType: ${response.contentType}"
     //            }
     //      }
-    //  } catch (e) {	
+    //  } catch (e) {
     //      logger("postToInfluxDB(): Something went wrong when posting: ${e}","error")
     //  }
 }
@@ -649,8 +668,8 @@ def handleInfluxResponse(physicalgraph.device.HubResponse hubResponse) {
 
 /**
  *  manageSchedules()
- * 
- *  Configures/restarts scheduled tasks: 
+ *
+ *  Configures/restarts scheduled tasks:
  *   softPoll() - Run every {state.softPollingInterval} minutes.
  **/
 private manageSchedules() {
@@ -659,26 +678,26 @@ private manageSchedules() {
     // Generate a random offset (1-60):
     Random rand = new Random(now())
     def randomOffset = 0
-    
+
     // softPoll:
     try {
         unschedule(softPoll)
     }
     catch(e) {
-        // logger("manageSchedules(): Unschedule failed!","error")
+        logger("manageSchedules(): Unschedule failed!","error")
     }
 
     if (state.softPollingInterval > 0) {
         randomOffset = rand.nextInt(60)
-        logger("manageSchedules(): Scheduling softpoll to run every ${state.softPollingInterval} minutes (offset of ${randomOffset} seconds).","trace")
+        logger("manageSchedules(): Scheduling softpoll to run every ${state.softPollingInterval} minutes (offset of ${randomOffset} seconds).","info")
         schedule("${randomOffset} 0/${state.softPollingInterval} * * * ?", "softPoll")
     }
-    
+
 }
 
 /**
  *  manageSubscriptions()
- * 
+ *
  *  Configures subscriptions.
  **/
 private manageSubscriptions() {
@@ -686,13 +705,13 @@ private manageSubscriptions() {
 
     // Unsubscribe:
     unsubscribe()
-    
+
     // Subscribe to App Touch events:
     subscribe(app,handleAppTouch)
-    
+
     // Subscribe to mode events:
     if (prefLogModeEvents) subscribe(location, "mode", handleModeEvent)
-    
+
     // Subscribe to device attributes (iterate over each attribute for each device collection in state.deviceAttributes):
     def devs // dynamic variable holding device collection.
     state.deviceAttributes.each { da ->
@@ -705,6 +724,9 @@ private manageSubscriptions() {
             }
         }
     }
+
+    // initialize counter to track number of events between softpolls
+    state.intervalEventCount = 0
 }
 
 /**
@@ -754,9 +776,9 @@ private encodeCredentialsBasic(username, password) {
  *  escapeStringForInfluxDB()
  *
  *  Escape values to InfluxDB.
- *  
- *  If a tag key, tag value, or field key contains a space, comma, or an equals sign = it must 
- *  be escaped using the backslash character \. Backslash characters do not need to be escaped. 
+ *
+ *  If a tag key, tag value, or field key contains a space, comma, or an equals sign = it must
+ *  be escaped using the backslash character \. Backslash characters do not need to be escaped.
  *  Commas and spaces will also need to be escaped for measurements, though equals signs = do not.
  *
  *  Further info: https://docs.influxdata.com/influxdb/v0.10/write_protocols/write_syntax/
@@ -779,10 +801,10 @@ private escapeStringForInfluxDB(str) {
  *  getGroupName()
  *
  *  Get the name of a 'Group' (i.e. Room) from its ID.
- *  
+ *
  *  This is done manually as there does not appear to be a way to enumerate
  *  groups from a SmartApp currently.
- * 
+ *
  *  GroupIds can be obtained from the SmartThings IDE under 'My Locations'.
  *
  *  See: https://community.smartthings.com/t/accessing-group-within-a-smartapp/6830
@@ -790,8 +812,16 @@ private escapeStringForInfluxDB(str) {
 private getGroupName(id) {
 
     if (id == null) {return 'Home'}
-    else if (id == 'XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX') {return 'Kitchen'}
-    else if (id == 'XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX') {return 'Lounge'}
-    else if (id == 'XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX') {return 'Office'}
-    else {return 'Unknown'}    
+    else if (id == 'f0fe7c02-612f-4659-8676-9ff3ea4e731e') {return 'Infrastructure'}
+    else if (id == 'b7690084-78cb-42d6-b7c4-1037d8ab94f0') {return 'Kitchen/dining'}
+    else if (id == 'a849bfe9-2413-495b-8e6e-bf396875b9b8') {return 'Office'}
+    else if (id == '6d456ca5-5ffa-4dcd-85e5-93da5c046e53') {return 'Kids Bedroom'}
+    else if (id == '5d407fe1-9f71-43c9-afca-eb472dcf18df') {return 'Living room'}
+    else if (id == '3d0b9b66-bf17-4bad-bdae-08f6557e3a59') {return 'Exterior'}
+    else if (id == '1ed39ebf-f214-46b5-bbf9-05ce31090a7c') {return 'Master Bedroom'}
+    else if (id == '1179dc64-8e65-4746-984d-ae5d458a083a') {return 'Garage'}
+    else {
+        logger("getGroupName(): missing room name for group id: ${id}","warn")
+        return 'Unknown'
+    }
 }
